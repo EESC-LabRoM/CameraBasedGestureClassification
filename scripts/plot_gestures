@@ -1,0 +1,164 @@
+#!/usr/bin/env python
+
+# This script is not intended to be run as a ros node!
+
+import pandas as pd
+from matplotlib import pyplot as plt
+import numpy as np
+from mpl_toolkits import mplot3d
+import argparse
+
+
+def to_numpy_array(row, landmark_name):
+    return np.array(
+        [
+            row[f"{landmark_name}_X"],
+            row[f"{landmark_name}_Y"],
+            row[f"{landmark_name}_Z"],
+        ]
+    )
+
+
+def set_offset(row):
+    wrist_pos = to_numpy_array(row, "WRIST")
+    wrist_as_row = np.tile(wrist_pos, [21, 1]).reshape(-1)
+    return row - wrist_as_row
+
+
+def normalize(row):
+    norm = np.linalg.norm(
+        to_numpy_array(row, "PINKY_MCP") - to_numpy_array(row, "WRIST")
+    )
+    return row / norm
+
+
+def align(row):
+
+    landmark_names = [
+        "WRIST",
+        "THUMB_CMC",
+        "THUMB_MCP",
+        "THUMB_IP",
+        "THUMB_TIP",
+        "INDEX_FINGER_MCP",
+        "INDEX_FINGER_PIP",
+        "INDEX_FINGER_DIP",
+        "INDEX_FINGER_TIP",
+        "MIDDLE_FINGER_MCP",
+        "MIDDLE_FINGER_PIP",
+        "MIDDLE_FINGER_DIP",
+        "MIDDLE_FINGER_TIP",
+        "RING_FINGER_MCP",
+        "RING_FINGER_PIP",
+        "RING_FINGER_DIP",
+        "RING_FINGER_TIP",
+        "PINKY_MCP",
+        "PINKY_PIP",
+        "PINKY_DIP",
+        "PINKY_TIP",
+    ]
+
+    wrist_pinky_v = to_numpy_array(row, "PINKY_MCP") - to_numpy_array(
+        row, "WRIST"
+    )
+    wrist_index_v = to_numpy_array(row, "INDEX_FINGER_MCP") - to_numpy_array(
+        row, "WRIST"
+    )
+    palm_normal = np.cross(wrist_pinky_v, wrist_index_v)
+
+    T_mat = np.eye(4)
+    T_mat[:3, :3] = np.c_[
+        palm_normal, np.cross(palm_normal, wrist_pinky_v), wrist_pinky_v
+    ]
+    # T_mat = np.linalg.inv(T_mat)
+    dict_row = {}
+    for name in landmark_names:
+        landmark_value = np.r_[to_numpy_array(row, name), [1]]
+        transformed_value = np.matmul(landmark_value, T_mat)
+        dict_row[f"{name}_X"] = transformed_value[0]
+        dict_row[f"{name}_Y"] = transformed_value[1]
+        dict_row[f"{name}_Z"] = transformed_value[2]
+
+    return pd.Series(dict_row)
+
+
+def plot_datapoint(ax, row):
+    lines = [
+        ["WRIST", "THUMB_CMC", "THUMB_MCP", "THUMB_IP", "THUMB_TIP"],
+        [
+            "WRIST",
+            "INDEX_FINGER_MCP",
+            "INDEX_FINGER_PIP",
+            "INDEX_FINGER_DIP",
+            "INDEX_FINGER_TIP",
+        ],
+        [
+            "MIDDLE_FINGER_MCP",
+            "MIDDLE_FINGER_PIP",
+            "MIDDLE_FINGER_DIP",
+            "MIDDLE_FINGER_TIP",
+        ],
+        [
+            "RING_FINGER_MCP",
+            "RING_FINGER_PIP",
+            "RING_FINGER_DIP",
+            "RING_FINGER_TIP",
+        ],
+        ["WRIST", "PINKY_MCP", "PINKY_PIP", "PINKY_DIP", "PINKY_TIP"],
+        [
+            "INDEX_FINGER_MCP",
+            "MIDDLE_FINGER_MCP",
+            "RING_FINGER_MCP",
+            "PINKY_MCP",
+        ],
+    ]
+
+    for line in lines:
+        zline = []
+        xline = []
+        yline = []
+        for landmark in line:
+            xline.append(row[f"{landmark}_X"])
+            yline.append(row[f"{landmark}_Y"])
+            zline.append(row[f"{landmark}_Z"])
+            ax.plot3D(xline, yline, zline, "gray")
+            ax.scatter3D(xline, yline, zline, cmap="Greens")
+
+
+def main():
+
+    parser = argparse.ArgumentParser(description="Capture hand gestures.")
+    parser.add_argument(
+        "--input", dest="input", help="Input file.", required=True
+    )
+    parsed, unknown = parser.parse_known_args()
+
+    df = pd.read_csv(parsed.input)
+    plt.style.use("seaborn-whitegrid")
+
+    processed_df = df.copy()
+    processed_df = processed_df.drop(["handedness"], axis=1)
+    processed_df = processed_df.apply(set_offset, axis=1)
+    processed_df = processed_df.apply(normalize, axis=1)
+    processed_df = processed_df.apply(align, axis=1)
+
+    fig = plt.figure(figsize=(15, 14))
+    ax = fig.add_subplot(121, projection="3d")
+    ax.set_xlim(-0.15, 0.15)
+    ax.set_ylim(-0.15, 0.15)
+    ax.set_zlim(-0.15, 0.15)
+
+    plot_datapoint(ax, df.iloc[0])
+
+    ax = fig.add_subplot(122, projection="3d")
+    ax.set_xlim(-1.5, 1.5)
+    ax.set_ylim(-1.5, 1.5)
+    ax.set_zlim(0, 3)
+
+    plot_datapoint(ax, processed_df.iloc[0])
+
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()

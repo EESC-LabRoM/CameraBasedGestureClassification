@@ -1,0 +1,3 @@
+<launch>
+  <node name="realtime_detection" pkg="grasp_detection" type="realtime_detection_ros" args=" --input 4 --model_file $(find grasp_detection)/trained_models/trained_model.sav" output="screen" />
+</launch>

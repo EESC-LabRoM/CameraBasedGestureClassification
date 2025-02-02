@@ -1,0 +1,514 @@
+#!/usr/bin/env python
+
+# This script is not intended to be run as a ros node!
+
+from math import floor
+import cv2
+from cv2 import flip
+import mediapipe as mp
+from google.protobuf.json_format import MessageToDict
+import os
+import yaml
+import pandas as pd
+import argparse
+import numpy as np
+import pickle
+
+from sklearn import svm
+from collections import deque
+from scipy import stats
+
+import time
+from gesture_utils import (
+    align,
+    set_offset,
+    normalize,
+    rotate_180,
+    get_hand_joint_angles,
+)
+import datetime
+from os import listdir
+from os.path import isfile, join
+
+
+def progress_bar_string(progress, bar_size=15):
+    progress = max(0, min(1, progress))
+    no_filled = floor(progress * bar_size)
+    no_white = bar_size - no_filled
+    progress_str = no_filled * "▓"
+    progress_str += no_white * "░"
+    return progress_str
+
+
+def main():
+
+    parser = argparse.ArgumentParser(description="Capture hand gestures.")
+    parser.add_argument(
+        "--input",
+        dest="input",
+        default="4",
+        type=str,
+        help="Camera id (as reported by v4l2-ctl) or video file path.",
+    )
+    parser.add_argument(
+        "--width", dest="width", default=1920, type=int, help="Camera width."
+    )
+    parser.add_argument(
+        "--height",
+        dest="height",
+        default=1080,
+        type=int,
+        help="Camera height.",
+    )
+    parser.add_argument(
+        "--fps", dest="fps", type=int, default=30, help="Camera fps."
+    )
+    parser.add_argument(
+        "--pred_hist_size",
+        dest="pred_hist_size",
+        type=int,
+        default=10,
+        help="Size of prediction history to consider",
+    )
+    parser.add_argument(
+        "--model_file",
+        dest="model_file",
+        help="Trained model file.",
+        required=True,
+    )
+    parser.add_argument(
+        "--flip",
+        dest="flip",
+        help="Whether to flip the input image or not.",
+        default="true",
+    )
+
+    parser.add_argument(
+        "--output",
+        dest="output",
+        help="If specified, parses input file and output it to a file.",
+        default="",
+    )
+
+    parser.add_argument(
+        "--angles",
+        help="Store joint angles. Defaults to false",
+        default="true",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--no-angles",
+        dest="angles",
+        help="Store joint positions. Defaults to true",
+        default="true",
+        action="store_false",
+    )
+    parser.set_defaults(angles=False)
+
+    parsed, unknown = parser.parse_known_args()
+
+    mp_drawing = mp.solutions.drawing_utils
+    mp_drawing_styles = mp.solutions.drawing_styles
+    mp_hands = mp.solutions.hands
+
+    model = pickle.load(open(parsed.model_file, "rb"))
+
+    device_name = os.path.basename(parsed.input)
+    is_video = "." in device_name
+    out = None
+    curr_frame = 0
+    start = None
+    frame_ellapsed_list = deque(maxlen=100)
+    elapsed_time = time.time()
+    if not is_video and parsed.output != "":
+        print(
+            f"Error: setting an output file is only allowed when using a file"
+            f" as input. Aborting..."
+        )
+        quit()
+    if is_video:
+        # This is a video file
+        cap = cv2.VideoCapture(parsed.input)
+        length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        img_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        img_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    else:
+        # This is a webcam
+        cap = cv2.VideoCapture(int(parsed.input))
+        cap.set(
+            cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc("M", "J", "P", "G")
+        )
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, parsed.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, parsed.height)
+        cap.set(cv2.CAP_PROP_FPS, parsed.fps)
+        img_width = parsed.width
+        img_height = parsed.height
+
+    landmark_names = [
+        "WRIST",
+        "THUMB_CMC",
+        "THUMB_MCP",
+        "THUMB_IP",
+        "THUMB_TIP",
+        "INDEX_FINGER_MCP",
+        "INDEX_FINGER_PIP",
+        "INDEX_FINGER_DIP",
+        "INDEX_FINGER_TIP",
+        "MIDDLE_FINGER_MCP",
+        "MIDDLE_FINGER_PIP",
+        "MIDDLE_FINGER_DIP",
+        "MIDDLE_FINGER_TIP",
+        "RING_FINGER_MCP",
+        "RING_FINGER_PIP",
+        "RING_FINGER_DIP",
+        "RING_FINGER_TIP",
+        "PINKY_MCP",
+        "PINKY_PIP",
+        "PINKY_DIP",
+        "PINKY_TIP",
+    ]
+
+    landmark_data = {}
+    for name in landmark_names:
+        landmark_data[name] = []
+    landmark_data["handedness"] = []
+
+    last_predictions = {
+        "left": deque(maxlen=parsed.pred_hist_size),
+        "right": deque(maxlen=parsed.pred_hist_size),
+    }
+    for _ in range(parsed.pred_hist_size):
+        last_predictions["left"].append("Detecting gesture")
+        last_predictions["right"].append("Detecting gesture")
+
+    detection_box_color = (100, 90, 69)
+
+    # font
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    # org
+    org = (50, 50)
+
+    # fontScale
+    fontScale = 1
+
+    # Blue color in BGR
+    color = (250, 250, 250)
+    # color = (255, 0, 0)
+
+    # Line thickness of 2 px
+    thickness = 2
+
+    flip_input = parsed.flip.lower() == "true"
+    paused = False
+
+    target_img_dim = (250, 250)
+    grasp_imgs = {}
+    base_img_dir = "./grasp_imgs/"
+    image_files = [
+        f for f in listdir(base_img_dir) if isfile(join(base_img_dir, f))
+    ]
+    for file in image_files:
+        grasp_name = file.split(".")[0]
+        grasp_imgs[grasp_name] = cv2.imread(join(base_img_dir, file), -1)
+        grasp_imgs[grasp_name] = cv2.resize(
+            grasp_imgs[grasp_name],
+            target_img_dim,
+            interpolation=cv2.INTER_AREA,
+        )
+
+    bg_rect_dim = (460, img_height)
+    bg_rect_pos = (0, 0)
+
+    frame_width = img_width + bg_rect_dim[0]
+    frame_height = img_height
+    if is_video and parsed.output != "":
+        out = cv2.VideoWriter(
+            parsed.output,
+            cv2.VideoWriter_fourcc(*"XVID"),
+            # cv2.VideoWriter_fourcc("M", "J", "P", "G"),
+            int(cap.get(cv2.CAP_PROP_FPS)),
+            (
+                frame_width,
+                frame_height,
+            ),
+        )
+
+    output_frame = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
+
+    # print(grasp_imgs)
+    # quit()
+    with mp_hands.Hands(
+        model_complexity=1,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    ) as hands:
+        while cap.isOpened():
+            if not paused:
+                success, image = cap.read()
+                if is_video:
+                    if start is not None:
+                        end = time.time()
+                        progress = curr_frame / length
+                        frame_ellapsed_list.append(end - start)
+                        if (
+                            len(frame_ellapsed_list)
+                            == frame_ellapsed_list.maxlen
+                        ):
+                            frame_ellapsed = np.mean(frame_ellapsed_list)
+                            time_remmaining = (
+                                length - curr_frame
+                            ) * frame_ellapsed
+                            time_remmaining_str = f"{datetime.timedelta(seconds=time_remmaining)}"
+                            time_remmaining_str = time_remmaining_str.split(
+                                "."
+                            )[0]
+                        else:
+                            time_remmaining_str = "Calculating"
+                        total_time_str = (
+                            f"{datetime.timedelta(seconds=time.time() - elapsed_time)}"
+                        )
+                        total_time_str = total_time_str.split(".")[0]
+                        print(
+                            "Progress:"
+                            f" {progress_bar_string(progress, bar_size=20)}"
+                            f" {progress*100:.2f}%.     Time remaining:"
+                            f" {time_remmaining_str}    Total time:"
+                            f" {total_time_str}         ",
+                            end="\r",
+                        )
+                    start = time.time()
+                    curr_frame += 1
+            else:
+                image = orig_img.copy()
+                success = True
+            if not success:
+                if is_video:
+                    break
+                print("Ignoring empty camera frame.")
+                # If loading a video, use 'break' instead of 'continue'.
+                continue
+
+            key = cv2.waitKey(5)
+            if key == ord("q"):
+                break
+
+            if key == ord(" "):
+                # Using cv2.putText() method
+                paused = not paused
+                orig_img = image.copy()
+
+            # To improve performance, optionally mark the image as not writeable to
+            # pass by reference.
+            image.flags.writeable = False
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            if flip_input:
+                image = cv2.flip(image, 1)
+            results = hands.process(image)
+
+            # Draw the hand annotations on the image.
+            image.flags.writeable = True
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            min_y = 50
+            hands_prediction = {
+                "left": "not in view",
+                "right": "not in view",
+            }
+            if results.multi_hand_landmarks:
+                # Each element of results.multi_hand_landmarks is a detected hand
+                # print(len(results.multi_hand_landmarks))
+                for handness, hand_world_landmarks, hand_landmarks in zip(
+                    results.multi_handedness,
+                    results.multi_hand_world_landmarks,
+                    results.multi_hand_landmarks,
+                ):
+
+                    mp_drawing.draw_landmarks(
+                        image,
+                        hand_landmarks,
+                        mp_hands.HAND_CONNECTIONS,
+                        mp_drawing_styles.get_default_hand_landmarks_style(),
+                        mp_drawing_styles.get_default_hand_connections_style(),
+                    )
+
+                    handedness_dict = MessageToDict(handness)[
+                        "classification"
+                    ][0]
+
+                    hand_type = handedness_dict["label"].lower()
+
+                    # Handedness fix if image is not flipped:
+                    if not flip_input:
+                        if hand_type == "left":
+                            hand_type = "right"
+                        else:
+                            hand_type = "left"
+
+                    # Preparing data for inference
+                    sample = {}
+
+                    for name in landmark_names:
+                        landmark_id = eval("mp_hands.HandLandmark." + name)
+                        landmark_pos = hand_world_landmarks.landmark[
+                            landmark_id
+                        ]
+                        sample[f"{name}_X"] = [landmark_pos.x]
+                        sample[f"{name}_Y"] = [landmark_pos.y]
+                        sample[f"{name}_Z"] = [landmark_pos.z]
+
+                    # Now the pre-processing part:
+                    # We transform to a pandas series to use the pre-processing functions:
+                    sample = pd.DataFrame.from_dict(sample)
+                    sample = set_offset(sample)
+                    sample = normalize(sample)
+                    sample = align(sample)
+
+                    if parsed.angles:
+                        if hand_type == "left":
+                            sample = rotate_180(sample)
+
+                        joint_angles = get_hand_joint_angles(
+                            sample,
+                            hand_type == "left",
+                            # f"{hand_type}_hand",
+                        )
+                        angle_series = pd.Series(joint_angles).sort_index()
+                        # Finally we do inference:
+                        pred_value = model.predict(
+                            angle_series.values.reshape(1, -1)
+                        )
+                        pred_value = pred_value[0]
+                        if "_" in pred_value:
+                            split_pred = pred_value.split("_")
+                            pred_value = "_".join(split_pred[1:])
+                        last_predictions[hand_type].append(pred_value)
+                    else:
+                        sample = sample.drop(["WRIST_X", "WRIST_Y", "WRIST_Z"])
+
+                        # Finally we do inference:
+                        pred_value = model.predict(
+                            sample.values.reshape(1, -1)
+                        )
+                        pred_value = pred_value[0]
+                        if "_" in pred_value:
+                            split_pred = pred_value.split("_")
+                            pred_value = "_".join(split_pred[1:])
+                        last_predictions[hand_type].append(pred_value)
+
+                    # min_x = 2
+                    # min_y = 2
+                    # max_x = -2
+                    # max_y = -2
+                    # for point in hand_landmarks.landmark:
+                    #     if point.x < min_x:
+                    #         min_x = point.x
+                    #     if point.y < min_y:
+                    #         min_y = point.y
+                    #     if point.x > max_x:
+                    #         max_x = point.x
+                    #     if point.y > max_y:
+                    #         max_y = point.y
+                    # min_x = int(min_x * image.shape[1])
+                    # max_x = int(max_x * image.shape[1])
+                    # min_y = int(min_y * image.shape[0])
+                    # max_y = int(max_y * image.shape[0])
+
+                    # BBox
+                    # image = cv2.rectangle(
+                    #     image,
+                    #     (min_x, min_y),
+                    #     (max_x, max_y),
+                    #     detection_box_color,
+                    #     5,
+                    # )
+
+                    # image = cv2.rectangle(
+                    #     image,
+                    #     (min_x - 3, min_y - 100),
+                    #     (max_x + 3, min_y),
+                    #     detection_box_color,
+                    #     -5,
+                    # )
+                    pred = stats.mode(last_predictions[hand_type])[0][0]
+                    hands_prediction[hand_type] = pred
+                    # if len(results.multi_handedness) > 1:
+                    #     hand_type = "multi"
+
+                output_frame = cv2.rectangle(
+                    output_frame,
+                    bg_rect_pos,
+                    (
+                        bg_rect_pos[0] + bg_rect_dim[0],
+                        bg_rect_pos[1] + bg_rect_dim[1],
+                    ),
+                    detection_box_color,
+                    -1,
+                )
+
+                min_x = 50
+                # min_y = 50
+                for hand_type in ["left", "right"]:
+                    # image = cv2.putText(
+                    #     image,
+                    #     f"Hand: {hand_type}",
+                    #     (min_x, min_y),
+                    #     font,
+                    #     fontScale,
+                    #     color,
+                    #     thickness,
+                    #     cv2.LINE_AA,
+                    #     bottomLeftOrigin=False,
+                    # )
+                    # min_y += 50
+                    output_frame = cv2.putText(
+                        output_frame,
+                        f"{hand_type.capitalize()}:"
+                        f" {hands_prediction[hand_type]}",
+                        (min_x, min_y),
+                        font,
+                        fontScale,
+                        color,
+                        thickness,
+                        cv2.LINE_AA,
+                        bottomLeftOrigin=False,
+                    )
+                    if hands_prediction[hand_type] in grasp_imgs:
+                        grasp_img_offset_x = min_x
+                        grasp_img_offset_y = min_y
+                        grasp_img = grasp_imgs[hands_prediction[hand_type]]
+
+                        y1, y2 = (
+                            grasp_img_offset_y,
+                            grasp_img_offset_y + grasp_img.shape[0],
+                        )
+                        x1, x2 = (
+                            grasp_img_offset_x,
+                            grasp_img_offset_x + grasp_img.shape[1],
+                        )
+
+                        alpha_s = grasp_img[:, :, 3] / 255.0
+                        alpha_l = 1.0 - alpha_s
+
+                        for c in range(0, 3):
+                            output_frame[y1:y2, x1:x2, c] = (
+                                alpha_s * grasp_img[:, :, c]
+                                + alpha_l * output_frame[y1:y2, x1:x2, c]
+                            )
+
+                    min_y += 50 + target_img_dim[1]
+            output_frame[:, bg_rect_dim[0] :] = image
+            if out is not None:
+                out.write(output_frame)
+            else:
+                cv2.imshow("Realtime gesture detection", output_frame)
+            # else:
+    cap.release()
+    if out is not None:
+        out.release()
+    cv2.destroyAllWindows()
+    print("")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,434 @@
+#!/usr/bin/env python
+
+# This script is not intended to be run as a ros node!
+
+import cv2
+import mediapipe as mp
+from google.protobuf.json_format import MessageToDict
+import os
+import yaml
+import pandas as pd
+import argparse
+from grasp_detection.utils import (
+    align,
+    set_offset,
+    normalize,
+    rotate_180,
+    get_hand_joint_angles,
+)
+from collections import OrderedDict
+
+
+def main():
+
+    parser = argparse.ArgumentParser(description="Capture hand gestures.")
+    parser.add_argument(
+        "--input",
+        dest="input",
+        default="4",
+        type=str,
+        help="Camera id (as reported by v4l2-ctl) or video file path.",
+    )
+    parser.add_argument(
+        "--width", dest="width", default=1920, type=int, help="Camera width."
+    )
+    parser.add_argument(
+        "--height",
+        dest="height",
+        default=1080,
+        type=int,
+        help="Camera height.",
+    )
+    parser.add_argument(
+        "--fps", dest="fps", type=int, default=30, help="Camera fps."
+    )
+    parser.add_argument(
+        "--output", dest="output", help="Output file.", required=True
+    )
+    parser.add_argument(
+        "--gestures", dest="gestures", help="Gestures file.", required=True
+    )
+
+    parser.add_argument(
+        "--flip",
+        dest="flip",
+        help="Whether to flip the input image or not.",
+        default="true",
+    )
+
+    parser.add_argument(
+        "--angles",
+        help="Store joint angles. Defaults to false",
+        default="true",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--no-angles",
+        dest="angles",
+        help="Store joint positions. Defaults to true",
+        default="true",
+        action="store_false",
+    )
+    parser.set_defaults(angles=False)
+    parsed, unknown = parser.parse_known_args()
+    mp_drawing = mp.solutions.drawing_utils
+    mp_drawing_styles = mp.solutions.drawing_styles
+    mp_hands = mp.solutions.hands
+    flip_input = parsed.flip.lower() == "true"
+
+    device_name = os.path.basename(parsed.input)
+    is_video = "." in device_name
+    if is_video:
+        # This is a video file
+        cap = cv2.VideoCapture(parsed.input)
+    else:
+        # This is a webcam
+        cap = cv2.VideoCapture(int(parsed.input))
+        cap.set(
+            cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc("M", "J", "P", "G")
+        )
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, parsed.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, parsed.height)
+        cap.set(cv2.CAP_PROP_FPS, parsed.fps)
+
+    landmark_names = [
+        "WRIST",
+        "THUMB_CMC",
+        "THUMB_MCP",
+        "THUMB_IP",
+        "THUMB_TIP",
+        "INDEX_FINGER_MCP",
+        "INDEX_FINGER_PIP",
+        "INDEX_FINGER_DIP",
+        "INDEX_FINGER_TIP",
+        "MIDDLE_FINGER_MCP",
+        "MIDDLE_FINGER_PIP",
+        "MIDDLE_FINGER_DIP",
+        "MIDDLE_FINGER_TIP",
+        "RING_FINGER_MCP",
+        "RING_FINGER_PIP",
+        "RING_FINGER_DIP",
+        "RING_FINGER_TIP",
+        "PINKY_MCP",
+        "PINKY_PIP",
+        "PINKY_DIP",
+        "PINKY_TIP",
+    ]
+
+    landmark_data = {}
+    landmark_data["handedness"] = []
+    landmark_data["gesture"] = []
+    if not parsed.angles:
+        for name in landmark_names:
+            landmark_data[name] = []
+
+    # font
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    # org
+    org = (50, 50)
+
+    # fontScale
+    fontScale = 1
+
+    # Blue color in BGR
+    color = (255, 0, 0)
+
+    # Line thickness of 2 px
+    thickness = 2
+
+    fps_period = int(1000 / cap.get(cv2.CAP_PROP_FPS))
+    fps_period = 1
+
+    detection_box_color = (36, 255, 12)
+
+    paused = False
+    hand_to_save = "left"
+    with open(parsed.gestures) as file:
+        # The FullLoader parameter handles the conversion from YAML
+        # scalar values to Python the dictionary format
+        gestures = yaml.load(file, Loader=yaml.SafeLoader)
+    gesture_type_list = list(gestures.keys())
+    gesture_keys = [
+        ord(gestures[name]["key_number"]) for name in gesture_type_list
+    ]
+
+    with mp_hands.Hands(
+        model_complexity=1,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    ) as hands:
+        while cap.isOpened():
+            if not paused:
+                success, image = cap.read()
+            else:
+                image = orig_img.copy()
+                success = True
+            if not success:
+                if is_video:
+                    break
+                print("Ignoring empty camera frame.")
+                # If loading a video, use 'break' instead of 'continue'.
+                continue
+            key = cv2.waitKey(fps_period)
+            if key == ord("q"):
+                break
+
+            if key == ord(" "):
+                # Using cv2.putText() method
+                paused = not paused
+                orig_img = image.copy()
+
+            if key == ord("h"):
+                # Using cv2.putText() method
+                if hand_to_save == "right":
+                    hand_to_save = "left"
+                else:
+                    hand_to_save = "right"
+
+            # To improve performance, optionally mark the image as not writeable to
+            # pass by reference.
+            image.flags.writeable = False
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            if flip_input:
+                image = cv2.flip(image, 1)
+            results = hands.process(image)
+
+            # Draw the hand annotations on the image.
+            image.flags.writeable = True
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            if results.multi_hand_landmarks:
+                for handness, hand_world_landmarks, hand_landmarks in zip(
+                    results.multi_handedness,
+                    results.multi_hand_world_landmarks,
+                    results.multi_hand_landmarks,
+                ):
+                    handedness_dict = MessageToDict(handness)[
+                        "classification"
+                    ][0]
+
+                    hand_type = handedness_dict["label"].lower()
+
+                    # Handedness fix:
+                    if not flip_input:
+                        if hand_type == "left":
+                            hand_type = "right"
+                        else:
+                            hand_type = "left"
+
+                    if hand_type != hand_to_save:
+                        continue
+
+                    mp_drawing.draw_landmarks(
+                        image,
+                        hand_landmarks,
+                        mp_hands.HAND_CONNECTIONS,
+                        mp_drawing_styles.get_default_hand_landmarks_style(),
+                        mp_drawing_styles.get_default_hand_connections_style(),
+                    )
+
+                    min_x = 2
+                    min_y = 2
+                    max_x = -2
+                    max_y = -2
+                    for point in hand_landmarks.landmark:
+                        if point.x < min_x:
+                            min_x = point.x
+                        if point.y < min_y:
+                            min_y = point.y
+                        if point.x > max_x:
+                            max_x = point.x
+                        if point.y > max_y:
+                            max_y = point.y
+                    min_x = int(min_x * image.shape[1])
+                    max_x = int(max_x * image.shape[1])
+                    min_y = int(min_y * image.shape[0])
+                    max_y = int(max_y * image.shape[0])
+
+                    # BBox
+                    image = cv2.rectangle(
+                        image,
+                        (min_x, min_y),
+                        (max_x, max_y),
+                        detection_box_color,
+                        5,
+                    )
+
+                    image = cv2.rectangle(
+                        image,
+                        (min_x - 3, min_y - 50),
+                        (max_x + 3, min_y),
+                        detection_box_color,
+                        -5,
+                    )
+                    # min_y -= 50
+                    image = cv2.putText(
+                        image,
+                        f"{hand_type} hand",
+                        (min_x, min_y),
+                        font,
+                        fontScale,
+                        color,
+                        thickness,
+                        cv2.LINE_AA,
+                        bottomLeftOrigin=False,
+                    )
+
+                    if len(results.multi_handedness) > 1:
+                        hand_type = "multi"
+
+                    if key in gesture_keys:
+                        gesture_type = gesture_type_list[
+                            gesture_keys.index(key)
+                        ]
+                        print(
+                            f"Saving gesture '{gesture_type}' of"
+                            f" {hand_type} hand ..."
+                        )
+                        landmark_data["handedness"].append(hand_type)
+                        landmark_data["gesture"].append(gesture_type)
+                        if parsed.angles:
+                            sample = {}
+                        for name in landmark_names:
+                            landmark_id = eval("mp_hands.HandLandmark." + name)
+                            landmark_pos = hand_world_landmarks.landmark[
+                                landmark_id
+                            ]
+                            if parsed.angles:
+                                sample[f"{name}_X"] = [landmark_pos.x]
+                                sample[f"{name}_Y"] = [landmark_pos.y]
+                                sample[f"{name}_Z"] = [landmark_pos.z]
+                            else:
+                                landmark_data[name].append(
+                                    [
+                                        landmark_pos.x,
+                                        landmark_pos.y,
+                                        landmark_pos.z,
+                                    ]
+                                )
+                                print(landmark_data)
+                        if parsed.angles:
+                            sample = pd.DataFrame.from_dict(sample)
+                            sample = set_offset(sample)
+                            sample = normalize(sample)
+                            sample = align(sample)
+                            if hand_type == "left":
+                                sample = rotate_180(sample)
+                            joint_angles = get_hand_joint_angles(
+                                sample,
+                                hand_type == "left",
+                                # f"{hand_type}_hand",
+                            )
+                            for joint_name, value in joint_angles.items():
+                                if joint_name not in landmark_data:
+                                    landmark_data[joint_name] = []
+                                landmark_data[joint_name].append(value)
+                    if key == ord("-"):
+                        print("Deleting last gesture...")
+                        if len(landmark_data["handedness"]) > 0:
+                            landmark_data["handedness"].pop()
+                            landmark_data["gesture"].pop()
+                            for name in landmark_names:
+                                landmark_data[name].pop()
+
+            # Using cv2.putText() method
+            curr_y = org[1]
+            image = cv2.putText(
+                image,
+                f"Output file: '{parsed.output}'",
+                (org[0], curr_y),
+                font,
+                fontScale,
+                color,
+                thickness,
+                cv2.LINE_AA,
+            )
+            curr_y += 50
+            image = cv2.putText(
+                image,
+                f"Dataset size: {len(landmark_data['handedness'])}",
+                (org[0], curr_y),
+                font,
+                fontScale,
+                color,
+                thickness,
+                cv2.LINE_AA,
+            )
+            curr_y += 50
+            image = cv2.putText(
+                image,
+                f"Hand to analyze: {hand_to_save}",
+                (org[0], curr_y),
+                font,
+                fontScale,
+                color,
+                thickness,
+                cv2.LINE_AA,
+            )
+            if paused:
+                curr_y += 50
+                image = cv2.putText(
+                    image,
+                    f"Paused. Press spacebar to continue",
+                    (org[0], curr_y),
+                    font,
+                    fontScale,
+                    color,
+                    thickness,
+                    cv2.LINE_AA,
+                )
+            for name, info in gestures.items():
+                curr_y += 50
+                image = cv2.putText(
+                    image,
+                    f"{name}: {info['key_number']}",
+                    (org[0], curr_y),
+                    font,
+                    fontScale,
+                    color,
+                    thickness,
+                    cv2.LINE_AA,
+                )
+
+            cv2.imshow("MediaPipe Hands", image)
+
+        landmark_data_processed = {}
+        if parsed.angles:
+            landmark_data_processed = landmark_data
+        else:
+            for name, points in landmark_data.items():
+                # print(f"{name}: {value}")
+                if len(points) == 0:
+                    print("No data captured.")
+                    break
+                if name == "handedness":
+                    landmark_data_processed["handedness"] = points
+                elif name == "gesture":
+                    landmark_data_processed["gesture"] = points
+                else:
+                    # Spliting position vectors into separate columns
+                    landmark_data_processed[f"{name}_X"] = [
+                        point[0] for point in points
+                    ]
+                    landmark_data_processed[f"{name}_Y"] = [
+                        point[1] for point in points
+                    ]
+                    landmark_data_processed[f"{name}_Z"] = [
+                        point[2] for point in points
+                    ]
+
+    if len(landmark_data_processed) != 0:
+        df = pd.DataFrame.from_dict(landmark_data_processed)
+        df = df.reindex(sorted(df.columns), axis=1)
+        df.to_csv(
+            parsed.output,
+            mode="a",
+            header=not os.path.exists(parsed.output),
+            index=False,
+        )
+    cap.release()
+
+
+if __name__ == "__main__":
+    main()
